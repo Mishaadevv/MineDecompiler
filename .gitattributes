@@ -1,0 +1,10 @@
+# Normalize line endings: text files get LF in the repo, native endings on checkout.
+* text=auto
+
+# Windows launchers must keep CRLF.
+*.bat text eol=crlf
+
+# Never mangle binaries.
+*.jar binary
+*.gz binary
+*.ico binary

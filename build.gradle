@@ -1,0 +1,186 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'app.minemod'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Bytecode analysis
+    implementation 'org.ow2.asm:asm:9.7'
+    implementation 'org.ow2.asm:asm-tree:9.7'
+    implementation 'org.ow2.asm:asm-analysis:9.7'
+    implementation 'org.ow2.asm:asm-util:9.7'
+
+    // Decompiler engine (library use, see VineflowerEngine)
+    implementation 'org.vineflower:vineflower:1.11.2'
+
+    // JSON for metadata / cache manifests
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // Logging (lightweight, no config required)
+    implementation 'org.slf4j:slf4j-api:2.0.13'
+    implementation 'org.slf4j:slf4j-simple:2.0.13'
+
+    // Tests
+    testImplementation platform('org.junit:junit-bom:5.10.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    // GUI entry point (Swing). CLI is app.cli.MainCli via startScripts / run task config.
+    mainClass = 'app.ui.App'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+    }
+}
+
+// Produce a fat/standalone jar for CLI + GUI: ./gradlew shadow-like fatJar without extra plugins
+tasks.register('fatJar', Jar) {
+    group = 'build'
+    description = 'Builds a standalone jar with all dependencies (for mcdecompiler CLI/GUI).'
+    archiveBaseName = 'mcdecompiler'
+    archiveClassifier = 'all'
+    archiveVersion = '' // stable name: mcdecompiler-all.jar (used by packageExe/jpackage)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            // Bootstrap: runs even on Java 8, auto-selects a 17+ JVM, then
+            // hands over to the real main. See app.bootstrap.Bootstrap.
+            'Main-Class': 'app.bootstrap.Bootstrap',
+            'Multi-Release': true
+        )
+    }
+    from sourceSets.main.output
+    from sourceSets.bootstrap.output
+    dependsOn configurations.runtimeClasspath
+    from {
+        configurations.runtimeClasspath.findAll { it.name.endsWith('.jar') }.collect { zipTree(it) }
+    }
+}
+
+// Builds a real Windows program: build/dist/MinecraftDecompiler/MinecraftDecompiler.exe
+// (app-image with its own Java runtime — no installed Java needed to run it).
+// Requires a JDK 17+ (jpackage ships with the JDK, no extra downloads).
+tasks.register('packageExe') {
+    group = 'distribution'
+    description = 'Builds MinecraftDecompiler.exe via jpackage (Windows app-image with bundled runtime).'
+    dependsOn tasks.named('fatJar')
+    onlyIf { System.getProperty('os.name', '').toLowerCase().contains('win') }
+
+    doLast {
+        def jdkHome = new File(System.getProperty('java.home'))
+        def jpackage = new File(jdkHome, 'bin/jpackage.exe')
+        if (!jpackage.isFile()) {
+            def javaHomeEnv = System.getenv('JAVA_HOME')
+            if (javaHomeEnv) {
+                jpackage = new File(javaHomeEnv, 'bin/jpackage.exe')
+            }
+        }
+        if (!jpackage.isFile()) {
+            throw new GradleException('jpackage not found. Build with a JDK 17+ (not a JRE).')
+        }
+        def buildDir = layout.buildDirectory.get().asFile
+        def inputDir = new File(buildDir, 'jpackage-input')
+        project.delete(inputDir)
+        inputDir.mkdirs()
+        project.copy {
+            from tasks.named('fatJar')
+            into inputDir
+        }
+        // Minimal runtime for the app, computed from actual module usage.
+        // (jdeps analyzes compiled classes + dependency jars; a fixed base set
+        // guarantees Swing/prefs/logging survive jdeps quirks on fat jars.)
+        def runtimeDir = new File(buildDir, 'jpackage-runtime')
+        def jdeps = new File(jdkHome, 'bin/jdeps.exe')
+        def jlink = new File(jdkHome, 'bin/jlink.exe')
+        boolean haveRuntime = false
+        if (jdeps.isFile() && jlink.isFile()) {
+            try {
+                def out = new ByteArrayOutputStream()
+                project.exec {
+                    commandLine jdeps.absolutePath, '--multi-release', '17',
+                        '--print-module-deps', '--ignore-missing-deps',
+                        '--class-path', sourceSets.main.runtimeClasspath.asPath,
+                        sourceSets.main.output.classesDirs.asPath,
+                        sourceSets.bootstrap.output.classesDirs.asPath
+                    standardOutput = out
+                }
+                def base = ['java.base', 'java.datatransfer', 'java.desktop',
+                    'java.logging', 'java.management', 'java.naming', 'java.prefs',
+                    'java.security.sasl', 'java.sql', 'java.xml', 'jdk.unsupported',
+                    'jdk.zipfs'] // zipfs: Vineflower opens jars/plugins via the ZIP FS provider
+                def found = out.toString().trim().split(',').collect { it.trim() }
+                        .findAll { !it.isEmpty() }
+                def modules = (found + base).unique().join(',')
+                logger.lifecycle("Runtime modules: ${modules}")
+                project.delete(runtimeDir)
+                project.exec {
+                    commandLine jlink.absolutePath, '--add-modules', modules,
+                        '--strip-debug', '--no-header-files', '--no-man-pages',
+                        '--compress=2', '--output', runtimeDir.absolutePath
+                }
+                haveRuntime = true
+            } catch (Exception e) {
+                logger.warn("Custom runtime build failed, jpackage will use the default runtime: ${e.message}")
+            }
+        }
+        def jpackageCmd = [jpackage.absolutePath,
+            '--type', 'app-image',
+            '--dest', new File(buildDir, 'dist').absolutePath,
+            '--name', 'MinecraftDecompiler',
+            '--app-version', project.version.toString(),
+            '--vendor', 'mcdecompiler',
+            '--description', 'Minecraft Source Reconstructor - standalone decompiler tool',
+            '--input', inputDir.absolutePath,
+            '--main-jar', 'mcdecompiler-all.jar',
+            '--main-class', 'app.ui.App',
+            '--java-options', '-Dfile.encoding=UTF-8',
+            '--add-launcher', "mcdecompiler-cli=${new File(projectDir, 'packaging/cli.properties').absolutePath}",
+            '--verbose']
+        if (haveRuntime) {
+            jpackageCmd.addAll(['--runtime-image', runtimeDir.absolutePath])
+        }
+        logger.lifecycle("Running: ${jpackageCmd.join(' ')}")
+        project.delete(new File(buildDir, 'dist/MinecraftDecompiler'))
+        project.exec {
+            commandLine jpackageCmd
+        }
+        logger.lifecycle('Done: build/dist/MinecraftDecompiler/MinecraftDecompiler.exe')
+    }
+}
+
+tasks.named('build') {
+    dependsOn tasks.named('test')
+    dependsOn tasks.named('compileBootstrapJava')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    // The bootstrap launcher must load even on Java 8 (it relaunches us on 17+).
+    options.release = it.name == 'compileBootstrapJava' ? 8 : 17
+}
+
+sourceSets {
+    bootstrap {
+        java {
+            srcDirs = ['src/bootstrap/java']
+        }
+    }
+}
