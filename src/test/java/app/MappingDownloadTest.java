@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -98,6 +99,30 @@ class MappingDownloadTest {
         assertEquals("https://example.com/b1.7.3.json",
                 find.invoke(null, manifest, GameVersion.classify("beta 1.7.3")));
         assertNull(find.invoke(null, manifest, GameVersion.classify("alpha 1.2.3_01")));
+    }
+
+    @Test
+    void keywordClassNamesNeverRewriteKeywords() {
+        app.mappings.MappingSet m = new app.mappings.MappingSet();
+        m.mapClass("if", "net/minecraft/block/WheatBlock");
+        m.mapClass("gh", "net/minecraft/client/Minecraft__32171470");
+        m.mapMethod("gh", "a", "()V", "tick");
+        String src = "public class gh {\n"
+                + "    public void a() {\n"
+                + "        if (true) {\n"
+                + "            a();\n"
+                + "        }\n"
+                + "    }\n"
+                + "}\n";
+        var out = app.reconstruction.NameRemapper.remap(Map.of("gh", src), m);
+        String remapped = out.sourcesByNewInternal.get("net/minecraft/client/Minecraft__32171470");
+        assertNotNull(remapped);
+        assertTrue(remapped.contains("if (true)"),
+                "the 'if' keyword must survive, got:\n" + remapped);
+        assertTrue(remapped.contains("tick()"),
+                "real member rename must still work, got:\n" + remapped);
+        assertFalse(remapped.contains("WheatBlock (true)"),
+                "keyword must not become a class name, got:\n" + remapped);
     }
 
     @Test

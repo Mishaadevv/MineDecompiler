@@ -48,9 +48,19 @@ public final class NameRemapper {
                 new ArrayList<>(mappings.getClasses().entrySet());
         classEntries.sort((a, b) -> Integer.compare(b.getKey().length(), a.getKey().length()));
         for (Map.Entry<String, String> c : classEntries) {
-            if (!c.getKey().equals(c.getValue())) {
-                classRules.add(new ClassRule(c.getKey(), c.getValue()));
+            if (c.getKey().equals(c.getValue())) {
+                continue;
             }
+            // Obfuscators reuse keywords ("if", "do") as class names; such a
+            // rule would rewrite the keyword everywhere (e.g. every "if (...)"
+            // becomes "WheatBlock (...)"). Skip it — references stay obfuscated
+            // but the language stays intact.
+            String simple = c.getKey().substring(c.getKey().lastIndexOf('/') + 1)
+                    .replace('$', '.').split("\\.")[0];
+            if (!isSafeName(simple)) {
+                continue;
+            }
+            classRules.add(new ClassRule(c.getKey(), c.getValue()));
         }
         List<MemberRule> methodRules = MemberRule.of(mappings.getMethods(), true);
         List<MemberRule> fieldRules = MemberRule.of(mappings.getFields(), false);
@@ -117,6 +127,31 @@ public final class NameRemapper {
             out.put(newInternal, transformed);
         }
         return new Result(out, renamed, memberHits, java.util.Collections.unmodifiableSet(renamedTargets));
+    }
+
+    /**
+     * Java reserved words + literals + restricted identifiers. Obfuscators
+     * (including old Minecraft-era ones) legally use these as class/member
+     * names — Feather really contains {@code CLASS if ... WheatBlock} and
+     * {@code CLASS do ... BoatEntity}. Decompilers cannot emit such names as
+     * identifiers either, so these rules must NEVER fire as text replacements:
+     * otherwise every {@code if} keyword in the project becomes a class name.
+     */
+    static final java.util.Set<String> RESERVED = java.util.Set.of(
+            "abstract", "assert", "boolean", "break", "byte", "case", "catch",
+            "char", "class", "const", "continue", "default", "do", "double",
+            "else", "enum", "extends", "final", "finally", "float", "for",
+            "goto", "if", "implements", "import", "instanceof", "int",
+            "interface", "long", "native", "new", "package", "private",
+            "protected", "public", "return", "short", "static", "strictfp",
+            "super", "switch", "synchronized", "this", "throw", "throws",
+            "transient", "try", "void", "volatile", "while",
+            "true", "false", "null", "_",
+            "var", "yield", "record", "sealed", "permits");
+
+    /** True when the simple name is safe to use as a replacement target. */
+    static boolean isSafeName(String simple) {
+        return !RESERVED.contains(simple);
     }
 
     private static boolean isPlausibleMemberName(String s) {
@@ -238,7 +273,7 @@ public final class NameRemapper {
                 String named = e.getValue();
                 if (obfMember.equals(named) || obfMember.isEmpty()
                         || obfMember.equals("<init>") || obfMember.equals("<clinit>")
-                        || !isPlausibleMemberName(obfMember)) {
+                        || !isPlausibleMemberName(obfMember) || !isSafeName(obfMember)) {
                     continue;
                 }
                 out.add(new MemberRule(owner, obfMember, named, method));
@@ -270,8 +305,10 @@ public final class NameRemapper {
             }
         }
         // If the file declares the obfuscated top-level class name, rename the declaration.
+        // (Skipped for keyword-named classes like "if" — same reason as above.)
         String obfSimple = obfInternal.substring(obfInternal.lastIndexOf('/') + 1).split("\\$")[0];
-        if (!obfSimple.equals(newSimple) && obfSimple.matches("[A-Za-z_$][A-Za-z0-9_$]*")
+        if (!obfSimple.equals(newSimple) && isSafeName(obfSimple)
+                && obfSimple.matches("[A-Za-z_$][A-Za-z0-9_$]*")
                 && newSimple.matches("[A-Za-z_$][A-Za-z0-9_$]*")) {
             out = out.replaceAll("(?<=(class|interface|enum|record)\\s)" + Pattern.quote(obfSimple)
                     + "(?=[\\s<{])", Matcher.quoteReplacement(newSimple));
